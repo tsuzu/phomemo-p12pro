@@ -287,28 +287,77 @@ async function sendPayload(payload, showAll) {
 }
 
 // ---- diagnostics ------------------------------------------------------------
-// Connect, subscribe to FF03, send the read-only query family, and log
-// every notification frame verbatim. Responses teach us the firmware's
-// dialect (status frame layout, model/version strings) without printing.
-async function diagnose(showAll) {
-  const device = await pickDevice(showAll);
+// Full-dump diagnostics. Enumerate the WHOLE GATT tree the page is
+// allowed to see (Web Bluetooth only exposes services named in
+// filters/optionalServices, so the diagnostic picker requests every
+// UART-ish candidate service), subscribe to every notify
+// characteristic, replay the read-only query family on FF02, then
+// test two activation hypotheses: setBTType (1F B2 00) before a feed
+// command, and a feed command on any alternate writable channel.
+const DIAG_SERVICES = [
+  0xff00, 0xffe0, 0xfff0, 0xae30, 0x18f0,
+  "49535343-fe7d-4ae5-8fa9-9fafd205e455",
+  "e7810a71-73ae-499d-8c15-faa9aef0c3f2",
+];
+
+function hexOf(view) {
+  return [...new Uint8Array(view.buffer, view.byteOffset, view.byteLength)]
+    .map(b => b.toString(16).padStart(2, "0")).join(" ");
+}
+function shortUuid(uuid) {
+  const m = uuid.match(/^0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb$/);
+  return m ? m[1] : uuid;
+}
+
+async function diagnose() {
+  const device = await navigator.bluetooth.requestDevice({
+    acceptAllDevices: true,
+    optionalServices: DIAG_SERVICES,
+  });
   log(`診断: 選択 name=${device.name || "(なし)"} id=${device.id}`);
   const server = await device.gatt.connect();
   log("診断: GATT接続 OK");
-  const service = await server.getPrimaryService(0xff00);
-  const chars = await service.getCharacteristics();
-  log(`診断: FF00 のキャラクタリスティクス: ${chars.map(c => c.uuid.slice(4, 8)).join(", ")}`);
-  const writeChar = await service.getCharacteristic(0xff02);
-  const flowChar = await service.getCharacteristic(0xff03);
-  await flowChar.startNotifications();
-  flowChar.addEventListener("characteristicvaluechanged", (e) => {
-    const v = e.target.value;
-    const hex = [...new Uint8Array(v.buffer, v.byteOffset, v.byteLength)]
-      .map(b => b.toString(16).padStart(2, "0")).join(" ");
-    const ascii = [...new Uint8Array(v.buffer, v.byteOffset, v.byteLength)]
-      .map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : ".").join("");
-    log(`診断 notify: ${hex}  |${ascii}|`);
-  });
+
+  // 1. Dump the whole visible GATT tree; subscribe to all notifiers.
+  const services = await server.getPrimaryServices();
+  let ff02 = null;
+  const altWriters = [];
+  for (const s of services) {
+    let chars = [];
+    try { chars = await s.getCharacteristics(); } catch (e) {
+      log(`診断: service ${shortUuid(s.uuid)} の特性列挙に失敗 (${e})`);
+      continue;
+    }
+    for (const c of chars) {
+      const props = ["read", "write", "writeWithoutResponse", "notify", "indicate"]
+        .filter(k => c.properties[k]).join("/");
+      log(`診断 GATT: ${shortUuid(s.uuid)} / ${shortUuid(c.uuid)} [${props}]`);
+      if (c.properties.notify || c.properties.indicate) {
+        try {
+          await c.startNotifications();
+          const tag = shortUuid(c.uuid);
+          c.addEventListener("characteristicvaluechanged", (e) => {
+            log(`診断 notify(${tag}): ${hexOf(e.target.value)}`);
+          });
+        } catch (e) { log(`診断: ${shortUuid(c.uuid)} の購読に失敗 (${e})`); }
+      }
+      if (shortUuid(c.uuid) === "ff02") ff02 = c;
+      else if (c.properties.write || c.properties.writeWithoutResponse) {
+        altWriters.push({ service: shortUuid(s.uuid), char: c });
+      }
+    }
+  }
+  if (!ff02) { log("診断: FF02 が見つかりません"); server.disconnect(); return; }
+  await sleep(500);
+
+  const send = async (label, bytes, char) => {
+    log(`診断 send ${label}: ${bytes.map(b => b.toString(16).padStart(2, "0")).join(" ")}`);
+    const target = char || ff02;
+    if (target.properties.write) await target.writeValueWithResponse(new Uint8Array(bytes));
+    else await target.writeValueWithoutResponse(new Uint8Array(bytes));
+  };
+
+  // 2. Read-only query family on FF02.
   const queries = [
     ["printerStatus", [0x1f, 0x20, 0x00]],
     ["getPrinterModel", [0x10, 0xff, 0x20, 0xf0]],
@@ -316,19 +365,28 @@ async function diagnose(showAll) {
     ["getPrinterSN", [0x10, 0xff, 0x20, 0xf2]],
     ["getPrinterBatteryVol", [0x10, 0xff, 0x50, 0xf1]],
     ["getPaperType", [0x1f, 0x80, 0x00]],
-    ["getDensity", [0x1f, 0x70, 0x00]],
-    ["getSpeed", [0x1f, 0x60, 0x00]],
-    ["getShutTime", [0x10, 0xff, 0x13]],
   ];
   for (const [name, bytes] of queries) {
-    log(`診断 query: ${name} (${bytes.map(b => b.toString(16).padStart(2, "0")).join(" ")})`);
-    await writeChar.writeValueWithResponse(new Uint8Array(bytes));
+    await send(name, bytes);
     await sleep(800);
   }
-  log("診断: 応答待ち (2秒)...");
+
+  // 3. Activation hypothesis: setBTType, then feed, then self-check.
+  await send("setBTType", [0x1f, 0xb2, 0x00]);
+  await sleep(800);
+  await send("feed(after BTType)", [0x1f, 0x11, 0x50]);
   await sleep(2000);
+  await send("selfCheck(after BTType)", [0x1f, 0x40]);
+  await sleep(2000);
+
+  // 4. Alternate writable channels: try a feed on each.
+  for (const w of altWriters) {
+    await send(`feed via ${w.service}/${shortUuid(w.char.uuid)}`, [0x1f, 0x11, 0x50], w.char);
+    await sleep(2000);
+  }
+
+  log("診断: 終了 (紙が動いた場面があれば教えてください)");
   server.disconnect();
-  log("診断: 終了");
 }
 
 // Send one small raw command over a fresh connection (self-check,
@@ -374,7 +432,7 @@ document.getElementById("btn-feed").addEventListener("click", async () => {
 document.getElementById("btn-diagnose").addEventListener("click", async () => {
   if (!navigator.bluetooth) return log("このブラウザは Web Bluetooth 非対応です");
   try {
-    await diagnose(document.getElementById("opt-show-all").checked);
+    await diagnose();
   } catch (err) {
     log("診断エラー: " + err);
   }
