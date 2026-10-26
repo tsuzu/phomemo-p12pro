@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>p12pro web — Phomemo P12 Pro プリンタ</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>p12pro <span class="sub">web</span></h1>
+  <p class="tagline">Phomemo P12 Pro にブラウザから直接印刷 (Web Bluetooth + Go/WebAssembly)</p>
+  <p id="env-warning" class="warning" hidden></p>
+</header>
+
+<main>
+  <section class="card">
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-mode="image" role="tab">画像</button>
+      <button class="tab" data-mode="text" role="tab">テキスト2段</button>
+      <button class="tab" data-mode="pattern" role="tab">テストパターン</button>
+    </div>
+
+    <!-- image mode -->
+    <div class="mode" id="mode-image">
+      <label class="row">画像ファイル (BMP/PNG/JPEG)
+        <input type="file" id="img-file" accept=".bmp,.png,.jpg,.jpeg,image/*">
+      </label>
+      <div class="grid">
+        <label>2値化
+          <select id="img-dither">
+            <option value="fs" selected>Floyd–Steinberg (写真向け)</option>
+            <option value="threshold">閾値 (線画向け)</option>
+          </select>
+        </label>
+        <label>回転
+          <select id="img-rotate">
+            <option value="90" selected>90° (ラベル向きの画像)</option>
+            <option value="-90">-90°</option>
+            <option value="0">なし (プリンタ向き)</option>
+            <option value="180">180°</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="img-invert"> 白黒反転</label>
+      </div>
+      <button class="primary" id="img-generate">プレビュー生成</button>
+    </div>
+
+    <!-- text mode -->
+    <div class="mode" id="mode-text" hidden>
+      <label class="row">上段 <input type="text" id="text-line1" value="調味料" placeholder="上段テキスト"></label>
+      <label class="row">下段 <input type="text" id="text-line2" value="しょうゆ" placeholder="下段テキスト (空欄なら1段)"></label>
+      <label class="row">フォント (.ttf/.otf/.ttc)
+        <input type="file" id="font-file" accept=".ttf,.otf,.ttc">
+      </label>
+      <div class="row inline">
+        <input type="url" id="font-url" value="https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf">
+        <button id="font-fetch">このURLから取得</button>
+      </div>
+      <p class="note" id="font-status">フォント未読込。ファイルを選ぶか、URLから取得してください (約16MB)。</p>
+      <div class="grid">
+        <label>ラベル長 (mm, 0=自動) <input type="number" id="text-length" value="0" min="0" step="1"></label>
+        <label>文字サイズ比 <input type="number" id="text-scale" value="0.85" min="0.3" max="1.2" step="0.05"></label>
+        <label>2値化
+          <select id="text-dither">
+            <option value="threshold" selected>閾値 (文字向け)</option>
+            <option value="fs">Floyd–Steinberg</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="text-invert"> 白黒反転</label>
+      </div>
+      <button class="primary" id="text-generate">プレビュー生成</button>
+    </div>
+
+    <!-- pattern mode -->
+    <div class="mode" id="mode-pattern" hidden>
+      <div class="grid">
+        <label>パターン長 (dots) <input type="number" id="pattern-height" value="320" min="40" step="8"></label>
+      </div>
+      <p class="note">枠・1mmルーラー・グラデーションの較正パターン。枠が欠ける側があれば有効印字幅の目安になります。</p>
+      <button class="primary" id="pattern-generate">プレビュー生成</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>共通設定</h2>
+    <div class="grid">
+      <label>ヘッド幅 (dots) <input type="number" id="opt-width" value="96" min="8" step="8"></label>
+      <label>濃度 (0=プリンタ設定)
+        <input type="number" id="opt-density" value="0" min="0" max="15">
+      </label>
+      <label>用紙
+        <select id="opt-paper">
+          <option value="continuous" selected>連続テープ</option>
+          <option value="gap">ギャップラベル</option>
+          <option value="mark">ブラックマーク</option>
+        </select>
+      </label>
+      <label>追加送り (mm) <input type="number" id="opt-feed" value="0" min="0" step="0.5"></label>
+    </div>
+  </section>
+
+  <section class="card" id="result-card" hidden>
+    <h2>プレビュー</h2>
+    <div class="preview-wrap"><img id="preview" alt="印刷プレビュー"></div>
+    <p class="note" id="result-info"></p>
+    <div class="actions">
+      <button class="primary" id="btn-print">Bluetoothで印刷</button>
+      <button id="btn-download">payload (.bin) を保存</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>ログ</h2>
+    <pre id="log"></pre>
+  </section>
+
+  <footer>
+    <p>印刷には Web Bluetooth 対応ブラウザ (Chrome / Edge) と HTTPS が必要です。
+    プロトコル: Zhuhai Quin / Print Master 0x1F (BLE FF00/FF02/FF03)。
+    CLI版と同じ Go コードを WebAssembly で実行しています。</p>
+    <p><a href="https://github.com/tsuzu/phomemo-p12pro">github.com/tsuzu/phomemo-p12pro</a></p>
+  </footer>
+</main>
+
+<script src="wasm_exec.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -46,6 +46,29 @@ $ go run ./cmd/p12pro probe --name P12  # GATT ツリーに FF00/FF02/FF03 が�
 FF00/FF02/FF03 が確認できれば、このツールの print 経路がそのまま使える
 可能性が高い。違っていたら probe の出力をもとにプロトコルを差し替える。
 
+## Web版 (WebAssembly + Web Bluetooth)
+
+ブラウザだけでも動く: **https://tsuzu.github.io/phomemo-p12pro/**
+
+- 画像印刷 / テキスト2段 / テストパターンの3モード。レンダリングは
+  CLI と同じ Go コードを WebAssembly 化したもの (`cmd/wasm`) で実行し、
+  印刷は Web Bluetooth で FF02 に直接送る (FF03 クレジット制御も実装)
+- 印刷には Chrome / Edge と HTTPS が必要 (Web Bluetooth の制約)。
+  プレビュー生成だけならどのブラウザでも動く
+- テキストモードのフォントはファイル指定か、デフォルト URL
+  (Noto Sans CJK, jsDelivr 経由) から取得する
+
+ローカルで動かす場合:
+
+```console
+make web   # web/p12pro.wasm と web/wasm_exec.js を生成
+python3 -m http.server -d web 8080
+# http://localhost:8080 を Chrome で開く
+```
+
+デプロイは `.github/workflows/pages.yml` が main への push で
+GitHub Pages に自動で行う。
+
 ## 使い方
 
 ```console
@@ -140,6 +163,8 @@ text 固有の主なフラグ:
 
 ```
 cmd/p12pro/          CLI (render/preview/text/print/scan/probe/testpattern)
+cmd/wasm/            WebAssembly 版 (JS API: 画像/テキスト/パターン → payload+preview)
+web/                 Web UI (Web Bluetooth 送信は JS 側, Pages にデプロイ)
 internal/imgproc/    画像処理 (BMP読込, 回転, リサイズ, ディザ, ビットパック, 較正パターン)
 internal/textlabel/  テキスト描画 (sfntフォント, 段組レイアウト, スーパーサンプリング)
 internal/quin/       0x1F プロトコル (ジョブ列生成, ZLIB stored 画像コマンド)

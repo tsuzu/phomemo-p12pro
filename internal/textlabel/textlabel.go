@@ -42,20 +42,32 @@ func LoadFont(path string) (*FontSource, error) {
 	if err != nil {
 		return nil, err
 	}
-	if strings.HasSuffix(strings.ToLower(path), ".ttc") {
+	src, err := ParseFont(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return src, nil
+}
+
+// ParseFont parses font data (TTF/OTF, or a TTC collection whose
+// first font is used) from memory. This is the entry point used in
+// environments without a filesystem, e.g. WebAssembly in a browser
+// where the font arrives as uploaded/downloaded bytes.
+func ParseFont(data []byte) (*FontSource, error) {
+	if len(data) >= 4 && string(data[:4]) == "ttcf" {
 		coll, err := sfnt.ParseCollection(data)
 		if err != nil {
-			return nil, fmt.Errorf("parse %s: %w", path, err)
+			return nil, fmt.Errorf("parse font collection: %w", err)
 		}
 		fnt, err := coll.Font(0)
 		if err != nil {
-			return nil, fmt.Errorf("collection %s: %w", path, err)
+			return nil, fmt.Errorf("font collection: %w", err)
 		}
 		return &FontSource{fnt: fnt}, nil
 	}
 	fnt, err := sfnt.Parse(data)
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, fmt.Errorf("parse font: %w", err)
 	}
 	return &FontSource{fnt: fnt}, nil
 }

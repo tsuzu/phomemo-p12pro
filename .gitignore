@@ -1,2 +1,4 @@
 /p12pro
 *.bin
+/web/p12pro.wasm
+/web/wasm_exec.js
