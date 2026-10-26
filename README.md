@@ -5,8 +5,8 @@ Phomemo **P12 Pro** に画像ファイル (BMP / PNG / JPEG) を印刷するた�
 まずは「画像を用意したら印刷できる」を目標にした最小構成:
 
 - 画像処理 (グレースケール化 → 回転 → ヘッド幅フィット → 2値化 → ビットパック)
-- Zhuhai Quin / "Print Master" 系プロトコル (0x1F コマンド列) の生成
-- BLE 送信 (FF00 サービス、FF03 クレジットベースのフロー制御)
+- **P12 ネイティブプロトコル** の生成 (初期化シーケンス + ESC/POS ラスター。下記)
+- BLE 送信 (FF00 サービス / FF02 書き込み / FF03 通知)
 - ハードウェアなしで検証できる `render` (バイナリ生成) と `preview` (1bit プレビュー PNG)
 
 ## 仕様前提 (P12 Pro)
@@ -16,35 +16,34 @@ Phomemo **P12 Pro** に画像ファイル (BMP / PNG / JPEG) を印刷するた�
 | 解像度 | 203 dpi = 8 dots/mm |
 | テープ幅 | 12mm |
 | ヘッド幅 (デフォルト) | 96 dots (= 12mm)。一部資料では有効印字幅 9mm とも。`testpattern` で実測して `-width` で調整 |
-| テープ種別 | 連続テープ (`-paper continuous` がデフォルト) |
+| テープ種別 | 連続テープ |
 | 接続 | BLE (USB Type-C は充電専用) |
 
-## プロトコルについて — 要実機検証
+## プロトコルについて (実機検証で判明した経緯)
 
-P12 Pro は公式アプリ **Print Master** を使う機種で、同アプリを使う
-Marklife P12 / Phomemo D30 などは **Zhuhai Quin** 社のファームウェアで、
-以下の BLE GATT + 0x1F コマンド体系を使うことがリバースエンジニアリングで
-判明している (Dart ライブラリ `print_master_ble` ほか)。
+P12 Pro は公式アプリ **Print Master** を使うが、印字プロトコルは
+D30 系の Zhuhai Quin 0x1F ジョブ方式 **ではない**。実機検証
+(2026-10-26) の結果:
 
-- Service `0000ff00-...`, Write `0000ff02-...`, Notify/Flow `0000ff03-...`
-- 画像送信: `1F 10 <bytesPerRow BE> <height BE> <len BE> <ZLIB>`
-  - ZLIB はヘッダ `28 15` (1KB ウィンドウ)、deflate は stored (無圧縮)、Adler-32 BE
-  - ビットマップは 1bit パック、黒=1、MSB first
-- ジョブ列: `SetPaperType(1F 80 01 t)` → `Start(1F C0 01 00)` →
-  `AlignStart(1F 11 51)` → 画像 → `Stop(1F C0 01 01)` → `FeedEnd(1F 11 50)`
-- フロー制御: FF03 の通知 `[01, n]` が n チャンク分 (200 byte) のクレジット
+- GATT は Service `0000ff00-...`, Write `0000ff02-...`,
+  Notify `0000ff03-...` で Quin 系と同一。FF03 のクレジット通知
+  `[01, n]` とバッテリー通知 `[02, raw]` も来る
+- しかし Quin ジョブ (画像コマンド・`1F 40` セルフチェック・
+  `1F 11 50` 紙送り) は **すべて無反応** (紙が一切動かない)。
+  BLE モジュールだけが ACK を返し、印字エンジンに届いていない
+- 実際に動くのは **P12 ネイティブプロトコル** (`internal/p12`、
+  soburi/phomemo_p12 のリバースエンジニアリングと、それを使う
+  phomymo Web アプリに基づく):
+  1. 初期化シーケンス: `1F 11 xx` の6パケットを1つずつ送信し、
+     各パケット後にプリンタ応答 (FF03 通知) を最大500ms待つ
+  2. ヘッダ: `ESC @` (初期化) + `GS v 0` ラスター開始
+     `1D 76 30 00 <widthBytes LE> <rows LE>`
+  3. ラスター本体: 無圧縮の 1bit ビットマップ (黒=1、MSB first、
+     プリンタ向き)。128 byte ずつ応答なし書き込み、20ms 間隔
+  4. 紙送り: `ESC d 13` (`1B 64 0D`) を2回
 
-ただし **P12 Pro 実機での検証は未実施**。同系列でも亜種が存在する
-(例: M02/M110 系は ESC/POS ラスター方式で別プロトコル)。
-まず実機で次を確認すること:
-
-```console
-$ go run ./cmd/p12pro scan            # FF00 をアドバタイズするか
-$ go run ./cmd/p12pro probe --name P12  # GATT ツリーに FF00/FF02/FF03 があるか
-```
-
-FF00/FF02/FF03 が確認できれば、このツールの print 経路がそのまま使える
-可能性が高い。違っていたら probe の出力をもとにプロトコルを差し替える。
+旧 Quin 実装 (`internal/quin`) は D30 系向けに `-protocol quin`
+として残してある (デフォルトは `p12`)。
 
 ## Web版 (WebAssembly + Web Bluetooth)
 
@@ -52,7 +51,8 @@ FF00/FF02/FF03 が確認できれば、このツールの print 経路がその�
 
 - 画像印刷 / テキスト2段 / テストパターンの3モード。レンダリングは
   CLI と同じ Go コードを WebAssembly 化したもの (`cmd/wasm`) で実行し、
-  印刷は Web Bluetooth で FF02 に直接送る (FF03 クレジット制御も実装)
+  印刷は Web Bluetooth で FF02 に直接送る (P12 ネイティブプロトコルの
+  ペーシングを JS 側で再現)
 - 印刷には Chrome / Edge と HTTPS が必要 (Web Bluetooth の制約)。
   プレビュー生成だけならどのブラウザでも動く
 - テキストモードのフォントはファイル指定か、デフォルト URL
@@ -167,11 +167,12 @@ cmd/wasm/            WebAssembly 版 (JS API: 画像/テキスト/パターン �
 web/                 Web UI (Web Bluetooth 送信は JS 側, Pages にデプロイ)
 internal/imgproc/    画像処理 (BMP読込, 回転, リサイズ, ディザ, ビットパック, 較正パターン)
 internal/textlabel/  テキスト描画 (sfntフォント, 段組レイアウト, スーパーサンプリング)
-internal/quin/       0x1F プロトコル (ジョブ列生成, ZLIB stored 画像コマンド)
-internal/bleprinter/ BLE トランスポート (tinygo bluetooth, クレジット制御)
+internal/p12/        P12 ネイティブプロトコル (初期化列 + ESC/POS ラスター) ※デフォルト
+internal/quin/       Quin 0x1F プロトコル (D30 系向け, -protocol quin)
+internal/bleprinter/ BLE トランスポート (tinygo bluetooth)
 ```
 
-コア (imgproc / quin) は外部依存が `golang.org/x/image` のみで、
+コア (imgproc / p12 / quin) は外部依存が `golang.org/x/image` のみで、
 単体テストでバイト列まで検証できる。BLE は `tinygo.org/x/bluetooth`
 (BlueZ / macOS / Windows 対応)。
 
@@ -183,12 +184,10 @@ go build ./... && go vet ./... && go test ./...
 
 ## 未検証・既知の制限
 
-- **実機未検証**: プロトコル同定 (FF00 の有無) と初回印刷が最初のマイルストーン。
+- P12 ネイティブプロトコルへの切替は実施済み (2026-10-26)。初回の
+  実機印刷で、印字の向き (上下・左右) と有効印字幅を最終確認する。
+  上下逆に出たら `-rotate -90` に変える。
 - 有効印字幅: 96 dots 前提だが、実機では左右マージンで狭い可能性がある。
   `testpattern` の枠が欠ける側を測って `-width` と配置を調整する。
-- テープ送り方向と回転の符号 (-rotate 90 / -90) は実機で一度確認が必要。
-  上下逆に出たら `-rotate -90` に変える。
-- BLE 書き込みは tinygo の制約で WriteWithoutResponse + クレジット制御 +
-  ペーシングで信頼性を確保している (Linux では WithResponse が使えない)。
-- ステータス取得 (電池・モデル名などの 0x10 クエリ) のコマンド定義は
-  `internal/quin` にあるが、応答を読む CLI は未実装。
+- BLE 書き込みは tinygo の制約で WriteWithoutResponse のみ
+  (プロトコルのペーシングは応答待ち + 遅延で再現している)。

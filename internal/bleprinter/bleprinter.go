@@ -17,6 +17,7 @@ import (
 
 	"tinygo.org/x/bluetooth"
 
+	"github.com/tsuzu/phomemo-p12pro/internal/p12"
 	"github.com/tsuzu/phomemo-p12pro/internal/quin"
 )
 
@@ -160,6 +161,7 @@ type Printer struct {
 	mu      sync.Mutex
 	credits int
 	notify  chan struct{} // signaled when credits increase
+	anyNtf  chan struct{} // signaled on every FF03 frame
 	// OnNotify, if set, receives non-flow-control notifications.
 	OnNotify func(data []byte)
 }
@@ -174,7 +176,7 @@ func Connect(address, name string, timeout time.Duration) (*Printer, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Printer{device: conn.device, notify: make(chan struct{}, 1)}
+	p := &Printer{device: conn.device, notify: make(chan struct{}, 1), anyNtf: make(chan struct{}, 1)}
 	svcUUID := bluetooth.New16BitUUID(quin.ServiceUUID16)
 	writeUUID := bluetooth.New16BitUUID(quin.WriteCharUUID16)
 	flowUUID := bluetooth.New16BitUUID(quin.FlowControlCharUUID16)
@@ -211,6 +213,10 @@ func Connect(address, name string, timeout time.Duration) (*Printer, error) {
 	}
 	if flow != nil {
 		err := flow.EnableNotifications(func(buf []byte) {
+			select {
+			case p.anyNtf <- struct{}{}:
+			default:
+			}
 			if len(buf) >= 2 && buf[0] == 0x01 {
 				p.mu.Lock()
 				p.credits += int(buf[1])
@@ -275,6 +281,47 @@ func (p *Printer) WritePayload(payload []byte, chunkSize int, withResponse bool)
 		} else {
 			time.Sleep(2 * time.Millisecond)
 		}
+	}
+	return nil
+}
+
+// WaitNotify waits until any FF03 notification arrives, up to the
+// timeout. A pending signal from before the call is drained first,
+// so it reports frames that arrive after the call.
+func (p *Printer) WaitNotify(timeout time.Duration) bool {
+	select {
+	case <-p.anyNtf:
+	default:
+	}
+	select {
+	case <-p.anyNtf:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// PrintP12 sends a P12-protocol job with the pacing the reference
+// implementations use: init packets one by one, waiting briefly for
+// a printer response after each; then the body in 128-byte chunks
+// of write-without-response with 20ms delays.
+func (p *Printer) PrintP12(job p12.Job) error {
+	for _, pkt := range job.Init {
+		if _, err := p.write.WriteWithoutResponse(pkt); err != nil {
+			return fmt.Errorf("write init packet: %w", err)
+		}
+		p.WaitNotify(500 * time.Millisecond)
+	}
+	const chunk = 128
+	for off := 0; off < len(job.Body); off += chunk {
+		end := off + chunk
+		if end > len(job.Body) {
+			end = len(job.Body)
+		}
+		if _, err := p.write.WriteWithoutResponse(job.Body[off:end]); err != nil {
+			return fmt.Errorf("write body at %d: %w", off, err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	return nil
 }

@@ -3,16 +3,19 @@
 // Command wasm exposes the p12pro rendering pipeline to the browser.
 //
 // It registers three global functions; each returns an object
-// {payload, preview, width, height} or {error}:
+// {initPackets, payload, preview, width, height} or {error}:
 //
-//	p12proRenderImage(imageBytes: Uint8Array, opts) — BMP/PNG/JPEG -> job payload
+//	p12proRenderImage(imageBytes: Uint8Array, opts) — BMP/PNG/JPEG -> job
 //	p12proRenderText(lines: string[], fontBytes: Uint8Array, opts)
 //	p12proTestPattern(opts)
 //
-// "payload" is the full Quin 0x1F job byte stream (Uint8Array),
-// ready to be sent over Web Bluetooth by the page's JS. "preview"
-// is a PNG of the 1-bit bitmap, rotated back to authored (reading)
-// orientation when the job rotation is +/-90.
+// The job is a P12 native protocol job (see internal/p12):
+// "initPackets" is an array of Uint8Array the page sends first,
+// one write each with a response wait after each; "payload" is
+// the body (ESC/POS raster header + data + feeds) sent afterwards
+// in paced chunks. "preview" is a PNG of the 1-bit bitmap, rotated
+// back to authored (reading) orientation when the job rotation is
+// +/-90.
 //
 // The Bluetooth transport intentionally lives in JS (Web Bluetooth);
 // everything protocol/image related is shared Go code with the CLI.
@@ -27,12 +30,12 @@ import (
 	"syscall/js"
 
 	"github.com/tsuzu/phomemo-p12pro/internal/imgproc"
-	"github.com/tsuzu/phomemo-p12pro/internal/quin"
+	"github.com/tsuzu/phomemo-p12pro/internal/p12"
 	"github.com/tsuzu/phomemo-p12pro/internal/textlabel"
 )
 
 // version is stamped by the build; keep in sync with releases.
-const version = "0.2.0-wasm"
+const version = "0.3.0-wasm"
 
 func main() {
 	js.Global().Set("p12proVersion", version)
@@ -145,29 +148,10 @@ func parseAlign(s string) imgproc.Alignment {
 	}
 }
 
-func jobOptions(o js.Value) (quin.JobOptions, error) {
-	var p quin.PaperType
-	switch optString(o, "paper", "continuous") {
-	case "continuous":
-		p = quin.PaperContinuous
-	case "gap":
-		p = quin.PaperGap
-	case "mark":
-		p = quin.PaperBlackMark
-	default:
-		return quin.JobOptions{}, fmt.Errorf("unknown paper %q", optString(o, "paper", ""))
-	}
-	return quin.JobOptions{
-		Paper:         p,
-		Density:       optInt(o, "density", 0),
-		FeedAfterDots: int(optFloat(o, "extraFeedMM", 0) * 8),
-	}, nil
-}
-
 // result builds the return object. authoredRotate is the rotation
 // that was applied to reach printer orientation (90/-90/0); the
 // preview is rotated back so it reads naturally on screen.
-func result(bm *imgproc.Bitmap, payload []byte, authoredRotate int) js.Value {
+func result(bm *imgproc.Bitmap, job p12.Job, authoredRotate int) js.Value {
 	gray := bm.ToGrayImage()
 	switch authoredRotate {
 	case 90:
@@ -178,8 +162,13 @@ func result(bm *imgproc.Bitmap, payload []byte, authoredRotate int) js.Value {
 	var buf bytes.Buffer
 	_ = png.Encode(&buf, imgproc.ScaleNN(gray, 2))
 
+	init := js.Global().Get("Array").New(len(job.Init))
+	for i, pkt := range job.Init {
+		init.SetIndex(i, bytesToJS(pkt))
+	}
 	obj := js.Global().Get("Object").New()
-	obj.Set("payload", bytesToJS(payload))
+	obj.Set("initPackets", init)
+	obj.Set("payload", bytesToJS(job.Body))
 	obj.Set("preview", bytesToJS(buf.Bytes()))
 	obj.Set("width", bm.Width)
 	obj.Set("height", bm.Height)
@@ -204,12 +193,8 @@ func rotate(src *image.Gray, deg int) *image.Gray {
 	return dst
 }
 
-func buildPayload(bm *imgproc.Bitmap, o js.Value) ([]byte, error) {
-	jo, err := jobOptions(o)
-	if err != nil {
-		return nil, err
-	}
-	return quin.BuildJob(bm, jo)
+func buildJob(bm *imgproc.Bitmap, o js.Value) p12.Job {
+	return p12.BuildJob(bm, optFloat(o, "extraFeedMM", 0))
 }
 
 // --- exported functions -----------------------------------------------
@@ -241,11 +226,8 @@ func renderImage(args []js.Value) (js.Value, error) {
 	if err != nil {
 		return js.Value{}, err
 	}
-	payload, err := buildPayload(bm, o)
-	if err != nil {
-		return js.Value{}, err
-	}
-	return result(bm, payload, rotateDeg), nil
+	job := buildJob(bm, o)
+	return result(bm, job, rotateDeg), nil
 }
 
 func renderText(args []js.Value) (js.Value, error) {
@@ -298,11 +280,8 @@ func renderText(args []js.Value) (js.Value, error) {
 	if err != nil {
 		return js.Value{}, err
 	}
-	payload, err := buildPayload(bm, o)
-	if err != nil {
-		return js.Value{}, err
-	}
-	return result(bm, payload, rotateDeg), nil
+	job := buildJob(bm, o)
+	return result(bm, job, rotateDeg), nil
 }
 
 func testPattern(args []js.Value) (js.Value, error) {
@@ -320,10 +299,7 @@ func testPattern(args []js.Value) (js.Value, error) {
 	if err != nil {
 		return js.Value{}, err
 	}
-	payload, err := buildPayload(bm, o)
-	if err != nil {
-		return js.Value{}, err
-	}
+	job := buildJob(bm, o)
 	// The pattern is drawn in printer orientation; show as-is.
-	return result(bm, payload, 0), nil
+	return result(bm, job, 0), nil
 }

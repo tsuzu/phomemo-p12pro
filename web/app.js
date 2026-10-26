@@ -33,15 +33,13 @@ async function boot() {
 boot().catch(e => log("wasm load failed: " + e));
 
 // ---- shared state ------------------------------------------------------
-let currentPayload = null; // Uint8Array
+let currentJob = null;     // {initPackets: [Uint8Array], payload: Uint8Array}
 let imageBytes = null;     // Uint8Array
 let fontBytes = null;      // Uint8Array
 
 function commonOpts() {
   return {
     width: parseInt(document.getElementById("opt-width").value, 10) || 96,
-    density: parseInt(document.getElementById("opt-density").value, 10) || 0,
-    paper: document.getElementById("opt-paper").value,
     extraFeedMM: parseFloat(document.getElementById("opt-feed").value) || 0,
   };
 }
@@ -51,14 +49,15 @@ function showResult(res, what) {
     log(`${what}: エラー: ${res ? res.error : "no result"}`);
     return;
   }
-  currentPayload = res.payload;
+  currentJob = { initPackets: [...res.initPackets], payload: res.payload };
+  const total = res.payload.length + currentJob.initPackets.reduce((n, p) => n + p.length, 0);
   const url = URL.createObjectURL(new Blob([res.preview], { type: "image/png" }));
   const img = document.getElementById("preview");
   img.src = url;
   document.getElementById("result-info").textContent =
-    `ビットマップ ${res.width} x ${res.height} dots / payload ${res.payload.length} bytes`;
+    `ビットマップ ${res.width} x ${res.height} dots / ジョブ総量 ${total} bytes (初期化 ${currentJob.initPackets.length} パケット + 本体 ${res.payload.length} bytes)`;
   document.getElementById("result-card").hidden = false;
-  log(`${what}: payload 生成 (${res.payload.length} bytes)`);
+  log(`${what}: ジョブ生成 (${total} bytes)`);
 }
 
 // ---- tabs ---------------------------------------------------------------
@@ -145,20 +144,33 @@ document.getElementById("pattern-generate").addEventListener("click", () => {
 
 // ---- download --------------------------------------------------------------
 document.getElementById("btn-download").addEventListener("click", () => {
-  if (!currentPayload) return;
-  const url = URL.createObjectURL(new Blob([currentPayload], { type: "application/octet-stream" }));
+  if (!currentJob) return;
+  const parts = [...currentJob.initPackets, currentJob.payload];
+  const url = URL.createObjectURL(new Blob(parts, { type: "application/octet-stream" }));
   const a = document.createElement("a");
   a.href = url;
-  a.download = "p12pro-payload.bin";
+  a.download = "p12pro-job.bin";
   a.click();
   URL.revokeObjectURL(url);
 });
 
 // ---- Web Bluetooth printing -------------------------------------------------
-// Same transport discipline as the CLI: write chunks of 200 bytes to
-// FF02, gated by credit notifications [0x01, n] on FF03; if credits
-// stall, fall back to paced writes.
+// P12 native protocol transport (mirrors the Go CLI): send the init
+// packets one write each, waiting up to 500ms for any FF03 frame
+// after each; then the body (ESC/POS raster) in 128-byte
+// write-without-response chunks with 20ms delays. No credit gating:
+// phomymo / soburi reference implementations pace purely by delay.
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Keep in sync with internal/p12.InitPackets.
+const P12_INIT_PACKETS = [
+  [0x1f, 0x11, 0x38],
+  [0x1f, 0x11, 0x11, 0x1f, 0x11, 0x12, 0x1f, 0x11, 0x09, 0x1f, 0x11, 0x13],
+  [0x1f, 0x11, 0x09],
+  [0x1f, 0x11, 0x19, 0x1f, 0x11, 0x11],
+  [0x1f, 0x11, 0x19],
+  [0x1f, 0x11, 0x07],
+].map(a => new Uint8Array(a));
 
 async function pickDevice(showAll) {
   if (showAll) {
@@ -189,7 +201,7 @@ async function pickDevice(showAll) {
   });
 }
 
-async function sendPayload(payload, showAll) {
+async function openPrinter(showAll) {
   const device = await pickDevice(showAll);
   log(`選択: name=${device.name || "(なし)"} id=${device.id}`);
   let server;
@@ -202,86 +214,49 @@ async function sendPayload(payload, showAll) {
       server = await device.gatt.connect();
     } catch (e2) {
       if (String(e2).includes("Unsupported device")) {
-        log("ヒント: 'Unsupported device' は、そのデバイスが GATT (BLE) 接続に対応していない" +
-            "エントリを選んだときに Chrome が出すエラーです。プリンタがデュアルモードの場合、" +
-            "一覧に同名の Classic 側エントリが混ざることがあります。別のエントリを選ぶか、" +
-            "OS の Bluetooth 設定でこのプリンタのペアリングを一度解除してから再試行してください" +
-            " (Web Bluetooth に OS ペアリングは不要です)。");
+        log("ヒント: 'Unsupported device' は Chrome が GATT 接続不可と判定したときのエラーです。" +
+            "Mac では macOS の Bluetooth 設定でペアリング済みだと発生します。システム設定で" +
+            "「このデバイスの登録を解除」し、プリンタの電源を入れ直してから再試行してください。");
       }
       throw e2;
     }
   }
   log("GATT接続 OK");
-  let service;
-  try {
-    service = await server.getPrimaryService(0xff00);
-  } catch (e) {
-    // Not a Quin / Print Master GATT layout. Dump what the device
-    // actually exposes — this doubles as the probe output.
-    try {
-      const services = await server.getPrimaryServices();
-      log("このデバイスのサービス一覧:");
-      for (const s of services) log(`  service ${s.uuid}`);
-    } catch (_) { /* ignore */ }
-    server.disconnect();
-    throw new Error("サービス FF00 が見つかりません。このプリンタは想定プロトコル (Print Master / Quin 0x1F) と異なる可能性があります");
-  }
+  const service = await server.getPrimaryService(0xff00);
   const writeChar = await service.getCharacteristic(0xff02);
-
-  let credits = 0;
-  let flowChar = null;
-  let creditWaiters = [];
-  const grant = (n) => {
-    credits += n;
-    const w = creditWaiters;
-    creditWaiters = [];
-    w.forEach(resolve => resolve());
-  };
+  const waiters = [];
   try {
-    flowChar = await service.getCharacteristic(0xff03);
+    const flowChar = await service.getCharacteristic(0xff03);
     await flowChar.startNotifications();
     flowChar.addEventListener("characteristicvaluechanged", (e) => {
       const v = e.target.value;
-      if (v.byteLength >= 2 && v.getUint8(0) === 0x01) {
-        grant(v.getUint8(1) === 0x04 ? 4 : v.getUint8(1));
-      } else if (v.byteLength >= 2 && v.getUint8(0) === 0x02) {
+      if (v.byteLength >= 2 && v.getUint8(0) === 0x02) {
         log(`バッテリー状態通知: raw=${v.getUint8(1)}`);
-      } else {
-        log(`printer notify: ${[...new Uint8Array(v.buffer, v.byteOffset, v.byteLength)].map(b => b.toString(16).padStart(2, "0")).join(" ")}`);
       }
+      const ws = waiters.splice(0);
+      ws.forEach(r => r());
     });
-    log("フロー制御 (FF03) 有効");
-  } catch (_) {
-    log("フロー制御なし: ペーシングのみで送信します");
-  }
+  } catch (_) { /* FF03 is optional for pacing waits */ }
+  const waitNotify = (ms) => new Promise(resolve => {
+    const t = setTimeout(resolve, ms);
+    waiters.push(() => { clearTimeout(t); resolve(); });
+  });
+  return { device, server, writeChar, waitNotify };
+}
 
-  function waitCredit(timeoutMs) {
-    if (credits > 0) return Promise.resolve(true);
-    return new Promise(resolve => {
-      const timer = setTimeout(() => resolve(false), timeoutMs);
-      creditWaiters.push(() => { clearTimeout(timer); resolve(true); });
-    });
+async function sendJob(job, showAll) {
+  const { server, writeChar, waitNotify } = await openPrinter(showAll);
+  for (let i = 0; i < job.initPackets.length; i++) {
+    await writeChar.writeValueWithoutResponse(job.initPackets[i]);
+    await waitNotify(500);
   }
-
-  const CHUNK = 200;
-  const noResponse = document.getElementById("opt-write-noresponse").checked;
-  if (noResponse) log("応答なし書き込みモードで送信します");
-  let useFlow = !!flowChar;
-  for (let off = 0; off < payload.length; off += CHUNK) {
-    if (useFlow) {
-      const ok = await waitCredit(off === 0 ? 5000 : 3000);
-      if (!ok) {
-        log("クレジットが止まったためフロー制御を解除します");
-        useFlow = false;
-      } else {
-        credits--;
-      }
-    }
-    const chunk = payload.subarray(off, Math.min(off + CHUNK, payload.length));
-    if (noResponse) await writeChar.writeValueWithoutResponse(chunk);
-    else await writeChar.writeValueWithResponse(chunk);
-    await sleep(useFlow ? 1 : 2);
-    if (off % (CHUNK * 20) === 0) log(`送信中 ${off}/${payload.length} bytes`);
+  log("初期化シーケンス完了。本体を送信します");
+  const CHUNK = 128;
+  const body = job.payload;
+  for (let off = 0; off < body.length; off += CHUNK) {
+    await writeChar.writeValueWithoutResponse(body.subarray(off, Math.min(off + CHUNK, body.length)));
+    await sleep(20);
+    if (off % (CHUNK * 20) === 0) log(`送信中 ${off}/${body.length} bytes`);
   }
   log("送信完了。印刷の終了を待っています...");
   await sleep(2000);
@@ -369,94 +344,30 @@ async function diagnose() {
   };
   await readFF01("接続直後");
 
-  const send = async (label, bytes, opts = {}) => {
-    const mode = opts.withoutResponse ? "応答なし" : "応答あり";
-    log(`診断 send ${label} [${mode}]: ${bytes.map(b => b.toString(16).padStart(2, "0")).join(" ")}`);
-    if (opts.withoutResponse) await ff02.writeValueWithoutResponse(new Uint8Array(bytes));
-    else await ff02.writeValueWithResponse(new Uint8Array(bytes));
-    await sleep(400);
-    await readFF01(label);
-  };
-
-  // 2. Read-only query family on FF02.
-  const queries = [
-    ["printerStatus", [0x1f, 0x20, 0x00]],
-    ["getPrinterModel", [0x10, 0xff, 0x20, 0xf0]],
-    ["getPrinterVersion", [0x10, 0xff, 0x20, 0xf1]],
-    ["getPrinterSN", [0x10, 0xff, 0x20, 0xf2]],
-    ["getPrinterBatteryVol", [0x10, 0xff, 0x50, 0xf1]],
-    ["getPaperType", [0x1f, 0x80, 0x00]],
-  ];
-  for (const [name, bytes] of queries) {
-    await send(name, bytes);
-    await sleep(400);
-  }
-
-  // 3. Activation hypothesis: setBTType, then feed, then self-check.
-  await send("setBTType", [0x1f, 0xb2, 0x00]);
-  await sleep(400);
-  await send("feed(after BTType)", [0x1f, 0x11, 0x50]);
-  await sleep(2000);
-
-  // 4. Write-mode hypothesis: feed + self-check WITHOUT response.
-  await send("feed(応答なし)", [0x1f, 0x11, 0x50], { withoutResponse: true });
-  await sleep(2000);
-  await send("selfCheck(応答なし)", [0x1f, 0x40], { withoutResponse: true });
-  await sleep(2000);
-  await send("selfCheck(after BTType)", [0x1f, 0x40]);
-  await sleep(2000);
-
-  // 5. Alternate writable channels: try a feed on each.
-  for (const w of altWriters) {
-    log(`診断 send feed via ${w.service}/${shortUuid(w.char.uuid)}`);
-    try {
-      if (w.char.properties.write) await w.char.writeValueWithResponse(new Uint8Array([0x1f, 0x11, 0x50]));
-      else await w.char.writeValueWithoutResponse(new Uint8Array([0x1f, 0x11, 0x50]));
-    } catch (e) { log(`診断: alternate feed 失敗 (${e})`); }
-    await sleep(2000);
-  }
+  // 2. With the GATT tree dumped and FF01 read, finish. (The old
+  // Quin query family is meaningless on the P12 native protocol.)
+  await readFF01("終了前");
 
   log("診断: 終了 (紙が動いた場面があれば教えてください)");
   server.disconnect();
 }
 
-// Send one small raw command over a fresh connection (self-check,
-// paper feed). Confirms whether ANY command produces a physical
-// reaction, independently of image encoding.
-async function sendRawCommand(label, bytes, showAll) {
-  const device = await pickDevice(showAll);
-  log(`${label}: 選択 name=${device.name || "(なし)"}`);
-  const server = await device.gatt.connect();
-  const service = await server.getPrimaryService(0xff00);
-  const writeChar = await service.getCharacteristic(0xff02);
-  try {
-    const flowChar = await service.getCharacteristic(0xff03);
-    await flowChar.startNotifications();
-    flowChar.addEventListener("characteristicvaluechanged", (e) => {
-      const v = e.target.value;
-      const hex = [...new Uint8Array(v.buffer, v.byteOffset, v.byteLength)]
-        .map(b => b.toString(16).padStart(2, "0")).join(" ");
-      log(`${label} notify: ${hex}`);
-    });
-  } catch (_) { /* flow char optional here */ }
-  await writeChar.writeValueWithResponse(new Uint8Array(bytes));
-  log(`${label}: コマンド送信 (${bytes.map(b => b.toString(16).padStart(2, "0")).join(" ")}) — 反応を3秒待ちます`);
-  await sleep(3000);
-  server.disconnect();
-  log(`${label}: 終了`);
-}
-
-document.getElementById("btn-selfcheck").addEventListener("click", async () => {
-  if (!navigator.bluetooth) return log("このブラウザは Web Bluetooth 非対応です");
-  try {
-    await sendRawCommand("セルフテスト", [0x1f, 0x40], document.getElementById("opt-show-all").checked);
-  } catch (err) { log("セルフテストエラー: " + err); }
-});
-
+// Paper-feed test in the P12 native protocol: init sequence, then
+// ESC d 13. Proves the command path reaches the print engine
+// without any image data involved.
 document.getElementById("btn-feed").addEventListener("click", async () => {
   if (!navigator.bluetooth) return log("このブラウザは Web Bluetooth 非対応です");
   try {
-    await sendRawCommand("紙送り", [0x1f, 0x11, 0x50], document.getElementById("opt-show-all").checked);
+    const { server, writeChar, waitNotify } = await openPrinter(document.getElementById("opt-show-all").checked);
+    for (const pkt of P12_INIT_PACKETS) {
+      await writeChar.writeValueWithoutResponse(pkt);
+      await waitNotify(500);
+    }
+    await writeChar.writeValueWithoutResponse(new Uint8Array([0x1b, 0x64, 0x0d]));
+    log("紙送り: 初期化 + ESC d 13 を送信。紙が動くか見てください (3秒待ちます)");
+    await sleep(3000);
+    server.disconnect();
+    log("紙送り: 終了");
   } catch (err) { log("紙送りエラー: " + err); }
 });
 
@@ -470,11 +381,11 @@ document.getElementById("btn-diagnose").addEventListener("click", async () => {
 });
 
 document.getElementById("btn-print").addEventListener("click", async () => {
-  if (!currentPayload) return log("先にプレビューを生成してください");
+  if (!currentJob) return log("先にプレビューを生成してください");
   if (!navigator.bluetooth) return log("このブラウザは Web Bluetooth 非対応です");
   const showAll = document.getElementById("opt-show-all").checked;
   try {
-    await sendPayload(currentPayload, showAll);
+    await sendJob(currentJob, showAll);
   } catch (err) {
     log("印刷エラー: " + err);
     if (String(err).includes("No available device") || String(err).includes("NotFoundError")) {

@@ -21,6 +21,7 @@ import (
 
 	"github.com/tsuzu/phomemo-p12pro/internal/bleprinter"
 	"github.com/tsuzu/phomemo-p12pro/internal/imgproc"
+	"github.com/tsuzu/phomemo-p12pro/internal/p12"
 	"github.com/tsuzu/phomemo-p12pro/internal/quin"
 	"github.com/tsuzu/phomemo-p12pro/internal/textlabel"
 )
@@ -149,15 +150,41 @@ func (f *imageFlags) bitmap() (*imgproc.Bitmap, error) {
 }
 
 type jobFlags struct {
+	protocol    string
 	paper       string
 	density     int
 	extraFeedMM float64
 }
 
 func addJobFlags(fs *flag.FlagSet, f *jobFlags) {
-	fs.StringVar(&f.paper, "paper", "continuous", "paper type: continuous (P12 tape), gap, mark")
-	fs.IntVar(&f.density, "density", 0, "print density 1-15 (0 = keep printer setting)")
+	fs.StringVar(&f.protocol, "protocol", "p12", "print protocol: p12 (P12/P12 Pro native) or quin (D30-family 0x1F jobs)")
+	fs.StringVar(&f.paper, "paper", "continuous", "paper type (quin protocol only): continuous (P12 tape), gap, mark")
+	fs.IntVar(&f.density, "density", 0, "print density 1-15, quin protocol only (0 = keep printer setting)")
 	fs.Float64Var(&f.extraFeedMM, "extra-feed-mm", 0, "extra feed after printing, in mm (tape lead-out to the cutter)")
+}
+
+// buildJob builds the wire job for the selected protocol. It
+// returns the flat byte stream (for files and serial devices) and,
+// for the p12 protocol, the structured job the BLE transport paces
+// through (init packets with response waits, chunked body).
+func (f *jobFlags) buildJob(bm *imgproc.Bitmap) ([]byte, *p12.Job, error) {
+	switch f.protocol {
+	case "p12":
+		job := p12.BuildJob(bm, f.extraFeedMM)
+		return job.Stream(), &job, nil
+	case "quin":
+		jo, err := f.options()
+		if err != nil {
+			return nil, nil, err
+		}
+		payload, err := quin.BuildJob(bm, jo)
+		if err != nil {
+			return nil, nil, err
+		}
+		return payload, nil, nil
+	default:
+		return nil, nil, fmt.Errorf("unknown -protocol %q", f.protocol)
+	}
 }
 
 func (f *jobFlags) options() (quin.JobOptions, error) {
@@ -199,8 +226,10 @@ func addTargetFlags(fs *flag.FlagSet, f *targetFlags, withDevice bool) {
 	}
 }
 
-// sendPayload delivers a built job to the chosen target.
-func sendPayload(f *targetFlags, payload []byte) error {
+// sendPayload delivers a built job to the chosen target. p12Job,
+// when non-nil, is sent with the P12 pacing over BLE; the flat
+// payload is used for serial devices and the quin protocol.
+func sendPayload(f *targetFlags, payload []byte, p12Job *p12.Job) error {
 	if f.device != "" {
 		return writeDeviceFile(f.device, payload)
 	}
@@ -215,7 +244,11 @@ func sendPayload(f *targetFlags, payload []byte) error {
 	pr.OnNotify = func(data []byte) {
 		fmt.Fprintf(os.Stderr, "printer notify: % x\n", data)
 	}
-	if err := pr.WritePayload(payload, f.chunk, !f.noResp); err != nil {
+	if p12Job != nil {
+		if err := pr.PrintP12(*p12Job); err != nil {
+			return err
+		}
+	} else if err := pr.WritePayload(payload, f.chunk, !f.noResp); err != nil {
 		return err
 	}
 	// Keep the link up briefly so the printer can finish the job
@@ -299,11 +332,7 @@ func cmdRender(args []string) error {
 	if err != nil {
 		return err
 	}
-	jo, err := job.options()
-	if err != nil {
-		return err
-	}
-	payload, err := quin.BuildJob(bm, jo)
+	payload, _, err := job.buildJob(bm)
 	if err != nil {
 		return err
 	}
@@ -415,11 +444,7 @@ func cmdText(args []string) error {
 	if err != nil {
 		return err
 	}
-	jo, err := job.options()
-	if err != nil {
-		return err
-	}
-	payload, err := quin.BuildJob(bm, jo)
+	payload, p12Job, err := job.buildJob(bm)
 	if err != nil {
 		return err
 	}
@@ -433,7 +458,7 @@ func cmdText(args []string) error {
 	if out != "" {
 		return writeOutput(out, payload)
 	}
-	if err := sendPayload(&tgt, payload); err != nil {
+	if err := sendPayload(&tgt, payload, p12Job); err != nil {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "done")
@@ -454,16 +479,12 @@ func cmdPrint(args []string) error {
 	if err != nil {
 		return err
 	}
-	jo, err := job.options()
-	if err != nil {
-		return err
-	}
-	payload, err := quin.BuildJob(bm, jo)
+	payload, p12Job, err := job.buildJob(bm)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "printing bitmap %dx%d, payload %d bytes\n", bm.Width, bm.Height, len(payload))
-	if err := sendPayload(&tgt, payload); err != nil {
+	if err := sendPayload(&tgt, payload, p12Job); err != nil {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "done")
@@ -508,9 +529,9 @@ func cmdProbe(args []string) error {
 		}
 	}
 	fmt.Println()
-	fmt.Println("Quin / Print Master protocol check: service 0000ff00-... with")
-	fmt.Println("chars 0000ff02-... (write) and 0000ff03-... (flow control)")
-	fmt.Println("must be present for this tool's print path to work.")
+	fmt.Println("Print path check: service 0000ff00-... with chars")
+	fmt.Println("0000ff02-... (write) and 0000ff03-... (notify) must be present.")
+	fmt.Println("Both the P12 native protocol (default) and the Quin protocol use it.")
 	return nil
 }
 
@@ -538,16 +559,12 @@ func cmdTestPattern(args []string) error {
 	if err != nil {
 		return err
 	}
-	jo, err := job.options()
-	if err != nil {
-		return err
-	}
-	payload, err := quin.BuildJob(bm, jo)
+	payload, p12Job, err := job.buildJob(bm)
 	if err != nil {
 		return err
 	}
 	if out != "" {
 		return writeOutput(out, payload)
 	}
-	return sendPayload(&tgt, payload)
+	return sendPayload(&tgt, payload, p12Job)
 }

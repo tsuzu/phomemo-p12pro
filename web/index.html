@@ -86,18 +86,9 @@
     <h2>共通設定</h2>
     <div class="grid">
       <label>ヘッド幅 (dots) <input type="number" id="opt-width" value="96" min="8" step="8"></label>
-      <label>濃度 (0=プリンタ設定)
-        <input type="number" id="opt-density" value="0" min="0" max="15">
-      </label>
-      <label>用紙
-        <select id="opt-paper">
-          <option value="continuous" selected>連続テープ</option>
-          <option value="gap">ギャップラベル</option>
-          <option value="mark">ブラックマーク</option>
-        </select>
-      </label>
       <label>追加送り (mm) <input type="number" id="opt-feed" value="0" min="0" step="0.5"></label>
     </div>
+    <p class="note">プロトコルは P12 ネイティブ (初期化シーケンス + ESC/POS ラスター) です。用紙タイプや濃度の指定はありません。</p>
   </section>
 
   <section class="card" id="result-card" hidden>
@@ -113,14 +104,10 @@
   <section class="card">
     <h2>プリンタ接続</h2>
     <label class="check"><input type="checkbox" id="opt-show-all"> 全てのデバイスを表示 (プリンタが一覧に出ないとき)</label>
-    <label class="check"><input type="checkbox" id="opt-write-noresponse"> 印刷データを応答なし書き込みで送る (実験)</label>
     <div class="actions">
-      <button id="btn-diagnose">プリンタ診断 (接続して状態を読む)</button>
-      <button id="btn-selfcheck">セルフテスト印刷 (プリンタ内蔵)</button>
-      <button id="btn-feed">紙送りテスト</button>
+      <button id="btn-diagnose">プリンタ診断 (GATT ツリー表示)</button>
+      <button id="btn-feed">紙送りテスト (初期化 + ESC d)</button>
     </div>
-    <p class="note">セルフテストはプリンタ内蔵パターンを印字します。出れば機構・テープ・ヘッドは正常で、
-    問題はこちらのジョブ側。出なければテープ装填 (裏表) や機構側の問題です。</p>
     <p class="note">デバイスが見つからないとき: ①プリンタがスマホの Print Master アプリと
     接続中だと検出できません (アプリを閉じるか、スマホの Bluetooth を OFF にしてください)。
     ②OS の Bluetooth 設定でのペアリングは Web Bluetooth には無関係です。
@@ -137,7 +124,7 @@
 
   <footer>
     <p>印刷には Web Bluetooth 対応ブラウザ (Chrome / Edge) と HTTPS が必要です。
-    プロトコル: Zhuhai Quin / Print Master 0x1F (BLE FF00/FF02/FF03)。
+    プロトコル: P12 ネイティブ (1F 11 初期化シーケンス + ESC/POS GS v 0 ラスター, BLE FF00/FF02/FF03)。
     CLI版と同じ Go コードを WebAssembly で実行しています。</p>
     <p><a href="https://github.com/tsuzu/phomemo-p12pro">github.com/tsuzu/phomemo-p12pro</a></p>
   </footer>
