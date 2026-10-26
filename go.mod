@@ -19,5 +19,6 @@ require (
 	github.com/tinygo-org/pio v0.3.0 // indirect
 	golang.org/x/exp v0.0.0-20260727155853-b88d891fe743 // indirect
 	golang.org/x/sys v0.11.0 // indirect
+	golang.org/x/text v0.16.0 // indirect
 	tinygo.org/x/espradio v0.3.0 // indirect
 )

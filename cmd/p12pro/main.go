@@ -22,6 +22,7 @@ import (
 	"github.com/tsuzu/phomemo-p12pro/internal/bleprinter"
 	"github.com/tsuzu/phomemo-p12pro/internal/imgproc"
 	"github.com/tsuzu/phomemo-p12pro/internal/quin"
+	"github.com/tsuzu/phomemo-p12pro/internal/textlabel"
 )
 
 func main() {
@@ -35,6 +36,8 @@ func main() {
 		err = cmdRender(os.Args[2:])
 	case "preview":
 		err = cmdPreview(os.Args[2:])
+	case "text":
+		err = cmdText(os.Args[2:])
 	case "print":
 		err = cmdPrint(os.Args[2:])
 	case "scan":
@@ -62,6 +65,7 @@ func usage() {
 Usage:
   p12pro render      -i image.bmp -o payload.bin [image flags] [job flags]
   p12pro preview     -i image.bmp -o preview.png [image flags]
+  p12pro text        "上段" "下段" (--name P12 | --address AA:BB:.. | --device /dev/rfcomm0 | -o payload.bin) [--font F] [--length-mm N]
   p12pro print       -i image.bmp (--name P12 | --address AA:BB:.. | --device /dev/rfcomm0) [flags]
   p12pro scan        [--timeout 10s]
   p12pro probe       (--name P12 | --address AA:BB:..)
@@ -242,6 +246,35 @@ func writeDeviceFile(path string, payload []byte) error {
 	return nil
 }
 
+func parseDither(s string) (imgproc.DitherMode, error) {
+	switch s {
+	case "fs":
+		return imgproc.DitherFloydSteinberg, nil
+	case "threshold", "none":
+		return imgproc.DitherThreshold, nil
+	default:
+		return 0, fmt.Errorf("unknown -dither %q (want fs or threshold)", s)
+	}
+}
+
+// writePreviewPNG writes the 1-bit bitmap as a PNG (black on white),
+// nearest-neighbour upscaled by scale.
+func writePreviewPNG(path string, bm *imgproc.Bitmap, scale int) error {
+	preview := bm.ToGrayImage()
+	if scale > 1 {
+		preview = imgproc.ScaleNN(preview, scale)
+	}
+	if path == "" || path == "-" {
+		return png.Encode(os.Stdout, preview)
+	}
+	fh, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer fh.Close()
+	return png.Encode(fh, preview)
+}
+
 func writeOutput(path string, data []byte) error {
 	if path == "" || path == "-" {
 		_, err := os.Stdout.Write(data)
@@ -292,21 +325,119 @@ func cmdPreview(args []string) error {
 	if err != nil {
 		return err
 	}
-	preview := bm.ToGrayImage()
-	if scale > 1 {
-		preview = imgproc.ScaleNN(preview, scale)
+	fmt.Fprintf(os.Stderr, "bitmap %dx%d\n", bm.Width, bm.Height)
+	return writePreviewPNG(out, bm, scale)
+}
+
+// cmdText renders 1 or 2 lines of text as a two-row label and
+// prints it (or writes the payload / a preview).
+//
+//	p12pro text "調味料" "しょうゆ" --name P12
+//	p12pro text "上段" "下段" -o payload.bin --preview preview.png
+func cmdText(args []string) error {
+	fs := flag.NewFlagSet("text", flag.ExitOnError)
+	var job jobFlags
+	var tgt targetFlags
+	var out, previewPath, fontPath, align, dither string
+	var width, gap, marginY, padX, supersample, threshold, rotate, previewScale int
+	var lengthMM, fontScale float64
+	var invert bool
+	addJobFlags(fs, &job)
+	addTargetFlags(fs, &tgt, true)
+	fs.StringVar(&out, "o", "", "write payload to file instead of printing")
+	fs.StringVar(&previewPath, "preview", "", "also write a 1-bit preview PNG to this path")
+	fs.IntVar(&previewScale, "preview-scale", 4, "preview PNG upscale factor")
+	fs.StringVar(&fontPath, "font", "", "font file (.ttf/.otf/.ttc); default: auto-detect a Japanese font (or $P12PRO_FONT)")
+	fs.Float64Var(&lengthMM, "length-mm", 0, "fixed label length in mm (0 = fit to text)")
+	fs.Float64Var(&fontScale, "font-scale", 0.85, "font em size as a fraction of the line height")
+	fs.StringVar(&align, "align", "center", "line alignment within the label: left, center, right")
+	fs.IntVar(&gap, "gap", 4, "blank dots between the two rows")
+	fs.IntVar(&marginY, "margin-y", 4, "blank dots above/below the rows")
+	fs.IntVar(&padX, "pad-x", 8, "blank dots at both ends of the label")
+	fs.IntVar(&supersample, "supersample", 4, "rendering supersample factor (higher = smoother)")
+	fs.IntVar(&width, "width", 96, "tape width in dots (96 = 12mm @ 203dpi)")
+	fs.IntVar(&rotate, "rotate", 90, "rotation to printer orientation: 90 or -90")
+	fs.StringVar(&dither, "dither", "threshold", "binarization: threshold (crisp text) or fs")
+	fs.IntVar(&threshold, "threshold", 128, "binarization threshold 0-255")
+	fs.BoolVar(&invert, "invert", false, "invert black/white (white text on black)")
+
+	// stdlib flag stops at the first positional argument; parse in a
+	// loop so flags may also come after the text lines.
+	var lines []string
+	rest := args
+	for len(rest) > 0 {
+		fs.Parse(rest)
+		rest = fs.Args()
+		if len(rest) > 0 {
+			lines = append(lines, rest[0])
+			rest = rest[1:]
+		}
 	}
-	w := os.Stdout
-	if out != "" && out != "-" {
-		fh, err := os.Create(out)
+	if len(lines) < 1 || len(lines) > 2 {
+		return fmt.Errorf("usage: p12pro text [flags] <line1> [line2]")
+	}
+	if fontPath == "" {
+		p, err := textlabel.DefaultFontPath()
 		if err != nil {
 			return err
 		}
-		defer fh.Close()
-		w = fh
+		fontPath = p
 	}
-	fmt.Fprintf(os.Stderr, "bitmap %dx%d\n", bm.Width, bm.Height)
-	return png.Encode(w, preview)
+	src, err := textlabel.LoadFont(fontPath)
+	if err != nil {
+		return err
+	}
+	labelImg, err := textlabel.Render(lines, src, textlabel.Options{
+		TapeWidthDots:   width,
+		MarginY:         marginY,
+		Gap:             gap,
+		PadX:            padX,
+		FontScale:       fontScale,
+		FixedLengthDots: int(lengthMM * 8), // 203dpi = 8 dots/mm
+		Align:           align,
+		Supersample:     supersample,
+	})
+	if err != nil {
+		return err
+	}
+	dm, err := parseDither(dither)
+	if err != nil {
+		return err
+	}
+	bm, err := imgproc.Process(labelImg, imgproc.Options{
+		PrinterWidth: width,
+		Rotate:       rotate,
+		Dither:       dm,
+		Threshold:    threshold,
+		Invert:       invert,
+		NoUpscale:    true,
+	})
+	if err != nil {
+		return err
+	}
+	jo, err := job.options()
+	if err != nil {
+		return err
+	}
+	payload, err := quin.BuildJob(bm, jo)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "text label %dx%d (authored %dx%d, font %s), payload %d bytes\n",
+		bm.Width, bm.Height, labelImg.Bounds().Dx(), labelImg.Bounds().Dy(), fontPath, len(payload))
+	if previewPath != "" {
+		if err := writePreviewPNG(previewPath, bm, previewScale); err != nil {
+			return err
+		}
+	}
+	if out != "" {
+		return writeOutput(out, payload)
+	}
+	if err := sendPayload(&tgt, payload); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "done")
+	return nil
 }
 
 func cmdPrint(args []string) error {

@@ -70,6 +70,45 @@ go run ./cmd/p12pro print -i label.bmp --device /dev/rfcomm0
 go run ./cmd/p12pro testpattern --name P12
 ```
 
+## テキストを2段で印刷する
+
+画像を作らなくても、文字列を直接渡せば2段組ラベルを印刷できる。
+フォントは自動検出 (Linux: Noto Sans CJK / macOS: ヒラギノ /
+Windows: 游ゴシック等) し、`--font` や環境変数 `P12PRO_FONT` で上書きできる。
+描画は 4倍スーパーサンプリング + 縮小で行い、12mm テープの
+1行あたり約42ドットでも漢字が潰れないようにしている。
+
+```console
+# 2段 (長さは文字に合わせて自動)
+go run ./cmd/p12pro text "調味料" "しょうゆ" --name P12
+
+# 1段だけ (行スロット全体を使うので大きく出る)
+go run ./cmd/p12pro text "しょうゆ" --name P12
+
+# 長さ固定 (40mm)、プレビュー付き、実印刷せずペイロードだけ
+go run ./cmd/p12pro text "期限" "2026.10.26" --length-mm 40 \
+    --preview preview.png -o payload.bin
+
+# 反転 (黒地に白文字)
+go run ./cmd/p12pro text "注意" "高温" --name P12 -invert
+```
+
+text 固有の主なフラグ:
+
+```
+--font          フォントファイル (.ttf/.otf/.ttc)
+--length-mm 0   ラベル長固定 mm (0 = 文字にフィット)
+--font-scale    行の高さに対するフォントサイズ比 (デフォルト 0.85)
+--align center  行の配置 left|center|right
+--gap 4         段間の余白 dots
+--margin-y 4    上下の余白 dots
+--pad-x 8       両端の余白 dots
+--supersample 4 描画のスーパーサンプリング倍率
+--dither        text ではデフォルト threshold (fs も選択可)
+```
+
+フラグは行テキストの前後どちらに置いてもよい。
+
 ## 画像の作り方
 
 - **向き**: ラベルとして見た向きで作る。横方向 = テープの送り方向 (ラベルの長さ)、
@@ -100,8 +139,9 @@ go run ./cmd/p12pro testpattern --name P12
 ## 構成
 
 ```
-cmd/p12pro/          CLI (render/preview/print/scan/probe/testpattern)
+cmd/p12pro/          CLI (render/preview/text/print/scan/probe/testpattern)
 internal/imgproc/    画像処理 (BMP読込, 回転, リサイズ, ディザ, ビットパック, 較正パターン)
+internal/textlabel/  テキスト描画 (sfntフォント, 段組レイアウト, スーパーサンプリング)
 internal/quin/       0x1F プロトコル (ジョブ列生成, ZLIB stored 画像コマンド)
 internal/bleprinter/ BLE トランスポート (tinygo bluetooth, クレジット制御)
 ```
