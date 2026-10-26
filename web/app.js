@@ -264,6 +264,8 @@ async function sendPayload(payload, showAll) {
   }
 
   const CHUNK = 200;
+  const noResponse = document.getElementById("opt-write-noresponse").checked;
+  if (noResponse) log("応答なし書き込みモードで送信します");
   let useFlow = !!flowChar;
   for (let off = 0; off < payload.length; off += CHUNK) {
     if (useFlow) {
@@ -276,7 +278,8 @@ async function sendPayload(payload, showAll) {
       }
     }
     const chunk = payload.subarray(off, Math.min(off + CHUNK, payload.length));
-    await writeChar.writeValueWithResponse(chunk);
+    if (noResponse) await writeChar.writeValueWithoutResponse(chunk);
+    else await writeChar.writeValueWithResponse(chunk);
     await sleep(useFlow ? 1 : 2);
     if (off % (CHUNK * 20) === 0) log(`送信中 ${off}/${payload.length} bytes`);
   }
@@ -320,7 +323,7 @@ async function diagnose() {
 
   // 1. Dump the whole visible GATT tree; subscribe to all notifiers.
   const services = await server.getPrimaryServices();
-  let ff02 = null;
+  let ff01 = null, ff02 = null;
   const altWriters = [];
   for (const s of services) {
     let chars = [];
@@ -341,6 +344,7 @@ async function diagnose() {
           });
         } catch (e) { log(`診断: ${shortUuid(c.uuid)} の購読に失敗 (${e})`); }
       }
+      if (shortUuid(c.uuid) === "ff01") ff01 = c;
       if (shortUuid(c.uuid) === "ff02") ff02 = c;
       else if (c.properties.write || c.properties.writeWithoutResponse) {
         altWriters.push({ service: shortUuid(s.uuid), char: c });
@@ -350,11 +354,28 @@ async function diagnose() {
   if (!ff02) { log("診断: FF02 が見つかりません"); server.disconnect(); return; }
   await sleep(500);
 
-  const send = async (label, bytes, char) => {
-    log(`診断 send ${label}: ${bytes.map(b => b.toString(16).padStart(2, "0")).join(" ")}`);
-    const target = char || ff02;
-    if (target.properties.write) await target.writeValueWithResponse(new Uint8Array(bytes));
-    else await target.writeValueWithoutResponse(new Uint8Array(bytes));
+  // FF01 is a read-only characteristic: on this family it is where
+  // query responses wait to be picked up. Read it after every step.
+  const readFF01 = async (label) => {
+    if (!ff01) return;
+    try {
+      const v = await ff01.readValue();
+      const bytes = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+      const ascii = [...bytes].map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : ".").join("");
+      log(`診断 FF01 (${label}): ${hexOf(v)}  |${ascii}|`);
+    } catch (e) {
+      log(`診断 FF01 (${label}): 読み取り失敗 (${e})`);
+    }
+  };
+  await readFF01("接続直後");
+
+  const send = async (label, bytes, opts = {}) => {
+    const mode = opts.withoutResponse ? "応答なし" : "応答あり";
+    log(`診断 send ${label} [${mode}]: ${bytes.map(b => b.toString(16).padStart(2, "0")).join(" ")}`);
+    if (opts.withoutResponse) await ff02.writeValueWithoutResponse(new Uint8Array(bytes));
+    else await ff02.writeValueWithResponse(new Uint8Array(bytes));
+    await sleep(400);
+    await readFF01(label);
   };
 
   // 2. Read-only query family on FF02.
@@ -368,20 +389,30 @@ async function diagnose() {
   ];
   for (const [name, bytes] of queries) {
     await send(name, bytes);
-    await sleep(800);
+    await sleep(400);
   }
 
   // 3. Activation hypothesis: setBTType, then feed, then self-check.
   await send("setBTType", [0x1f, 0xb2, 0x00]);
-  await sleep(800);
+  await sleep(400);
   await send("feed(after BTType)", [0x1f, 0x11, 0x50]);
+  await sleep(2000);
+
+  // 4. Write-mode hypothesis: feed + self-check WITHOUT response.
+  await send("feed(応答なし)", [0x1f, 0x11, 0x50], { withoutResponse: true });
+  await sleep(2000);
+  await send("selfCheck(応答なし)", [0x1f, 0x40], { withoutResponse: true });
   await sleep(2000);
   await send("selfCheck(after BTType)", [0x1f, 0x40]);
   await sleep(2000);
 
-  // 4. Alternate writable channels: try a feed on each.
+  // 5. Alternate writable channels: try a feed on each.
   for (const w of altWriters) {
-    await send(`feed via ${w.service}/${shortUuid(w.char.uuid)}`, [0x1f, 0x11, 0x50], w.char);
+    log(`診断 send feed via ${w.service}/${shortUuid(w.char.uuid)}`);
+    try {
+      if (w.char.properties.write) await w.char.writeValueWithResponse(new Uint8Array([0x1f, 0x11, 0x50]));
+      else await w.char.writeValueWithoutResponse(new Uint8Array([0x1f, 0x11, 0x50]));
+    } catch (e) { log(`診断: alternate feed 失敗 (${e})`); }
     await sleep(2000);
   }
 
