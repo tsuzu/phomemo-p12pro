@@ -160,13 +160,53 @@ document.getElementById("btn-download").addEventListener("click", () => {
 // stall, fall back to paced writes.
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function sendPayload(payload) {
-  const device = await navigator.bluetooth.requestDevice({
-    filters: [{ services: [0xff00] }],
+async function pickDevice(showAll) {
+  if (showAll) {
+    // Show every nearby BLE device. Needed when the printer does
+    // not advertise the FF00 service UUID (the filtered picker then
+    // reports "No compatible device found" even for a paired,
+    // powered-on printer). FF00 access is requested via
+    // optionalServices, and verified after connecting.
+    return navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: [0xff00],
+    });
+  }
+  // Filtered picker: match by advertised FF00 service, or by the
+  // known name prefixes of Print Master family printers (their
+  // advertisements do not always carry the service UUID).
+  return navigator.bluetooth.requestDevice({
+    filters: [
+      { services: [0xff00] },
+      { namePrefix: "P12" },
+      { namePrefix: "D30" },
+      { namePrefix: "D35" },
+      { namePrefix: "Q30" },
+      { namePrefix: "M02" },
+      { namePrefix: "Printer" },
+    ],
+    optionalServices: [0xff00],
   });
+}
+
+async function sendPayload(payload, showAll) {
+  const device = await pickDevice(showAll);
   log(`接続中: ${device.name || device.id}`);
   const server = await device.gatt.connect();
-  const service = await server.getPrimaryService(0xff00);
+  let service;
+  try {
+    service = await server.getPrimaryService(0xff00);
+  } catch (e) {
+    // Not a Quin / Print Master GATT layout. Dump what the device
+    // actually exposes — this doubles as the probe output.
+    try {
+      const services = await server.getPrimaryServices();
+      log("このデバイスのサービス一覧:");
+      for (const s of services) log(`  service ${s.uuid}`);
+    } catch (_) { /* ignore */ }
+    server.disconnect();
+    throw new Error("サービス FF00 が見つかりません。このプリンタは想定プロトコル (Print Master / Quin 0x1F) と異なる可能性があります");
+  }
   const writeChar = await service.getCharacteristic(0xff02);
 
   let credits = 0;
@@ -228,9 +268,15 @@ async function sendPayload(payload) {
 document.getElementById("btn-print").addEventListener("click", async () => {
   if (!currentPayload) return log("先にプレビューを生成してください");
   if (!navigator.bluetooth) return log("このブラウザは Web Bluetooth 非対応です");
+  const showAll = document.getElementById("opt-show-all").checked;
   try {
-    await sendPayload(currentPayload);
+    await sendPayload(currentPayload, showAll);
   } catch (err) {
     log("印刷エラー: " + err);
+    if (String(err).includes("No available device") || String(err).includes("NotFoundError")) {
+      log("ヒント: デバイス一覧に出ない場合は、下の「全てのデバイスを表示」を有効にして再試行してください。" +
+          "また、プリンタがスマホの Print Master アプリと接続中の間は検出できません (アプリを閉じる/スマホの Bluetooth を OFF)。" +
+          "OS の Bluetooth 設定でのペアリングは Web Bluetooth には不要です。");
+    }
   }
 });
