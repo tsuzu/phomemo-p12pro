@@ -108,14 +108,21 @@
       <button class="primary" id="btn-print">Bluetoothで印刷</button>
       <button id="btn-download">payload (.bin) を保存</button>
     </div>
+  </section>
+
+  <section class="card">
+    <h2>プリンタ接続</h2>
     <label class="check"><input type="checkbox" id="opt-show-all"> 全てのデバイスを表示 (プリンタが一覧に出ないとき)</label>
+    <div class="actions">
+      <button id="btn-diagnose">プリンタ診断 (接続して状態を読む)</button>
+    </div>
     <p class="note">デバイスが見つからないとき: ①プリンタがスマホの Print Master アプリと
     接続中だと検出できません (アプリを閉じるか、スマホの Bluetooth を OFF にしてください)。
     ②OS の Bluetooth 設定でのペアリングは Web Bluetooth には無関係です。
     ③上の「全てのデバイスを表示」を有効にすると、名前で選んで接続できます。<br>
-    "Unsupported device" と出るとき: デュアルモード機の Classic 側エントリを選んだ可能性があります。
-    一覧に同名が複数あれば別の方を選び、それでもダメなら OS の Bluetooth 設定で
-    プリンタのペアリングを解除してから再試行してください。</p>
+    "Unsupported device" と出るとき (主に Mac): macOS の Bluetooth 設定でプリンタを
+    ペアリング済みだと Chrome が接続を拒否することがあります。システム設定で
+    「このデバイスの登録を解除」してから、ページのピッカーだけで接続してください。</p>
   </section>
 
   <section class="card">

@@ -243,9 +243,11 @@ async function sendPayload(payload, showAll) {
     flowChar.addEventListener("characteristicvaluechanged", (e) => {
       const v = e.target.value;
       if (v.byteLength >= 2 && v.getUint8(0) === 0x01) {
-        grant(v.getUint8(1));
+        grant(v.getUint8(1) === 0x04 ? 4 : v.getUint8(1));
+      } else if (v.byteLength >= 2 && v.getUint8(0) === 0x02) {
+        log(`バッテリー状態通知: raw=${v.getUint8(1)}`);
       } else {
-        log(`printer notify: ${[...new Uint8Array(v.buffer)].map(b => b.toString(16).padStart(2, "0")).join(" ")}`);
+        log(`printer notify: ${[...new Uint8Array(v.buffer, v.byteOffset, v.byteLength)].map(b => b.toString(16).padStart(2, "0")).join(" ")}`);
       }
     });
     log("フロー制御 (FF03) 有効");
@@ -283,6 +285,60 @@ async function sendPayload(payload, showAll) {
   server.disconnect();
   log("切断しました");
 }
+
+// ---- diagnostics ------------------------------------------------------------
+// Connect, subscribe to FF03, send the read-only query family, and log
+// every notification frame verbatim. Responses teach us the firmware's
+// dialect (status frame layout, model/version strings) without printing.
+async function diagnose(showAll) {
+  const device = await pickDevice(showAll);
+  log(`診断: 選択 name=${device.name || "(なし)"} id=${device.id}`);
+  const server = await device.gatt.connect();
+  log("診断: GATT接続 OK");
+  const service = await server.getPrimaryService(0xff00);
+  const chars = await service.getCharacteristics();
+  log(`診断: FF00 のキャラクタリスティクス: ${chars.map(c => c.uuid.slice(4, 8)).join(", ")}`);
+  const writeChar = await service.getCharacteristic(0xff02);
+  const flowChar = await service.getCharacteristic(0xff03);
+  await flowChar.startNotifications();
+  flowChar.addEventListener("characteristicvaluechanged", (e) => {
+    const v = e.target.value;
+    const hex = [...new Uint8Array(v.buffer, v.byteOffset, v.byteLength)]
+      .map(b => b.toString(16).padStart(2, "0")).join(" ");
+    const ascii = [...new Uint8Array(v.buffer, v.byteOffset, v.byteLength)]
+      .map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : ".").join("");
+    log(`診断 notify: ${hex}  |${ascii}|`);
+  });
+  const queries = [
+    ["printerStatus", [0x1f, 0x20, 0x00]],
+    ["getPrinterModel", [0x10, 0xff, 0x20, 0xf0]],
+    ["getPrinterVersion", [0x10, 0xff, 0x20, 0xf1]],
+    ["getPrinterSN", [0x10, 0xff, 0x20, 0xf2]],
+    ["getPrinterBatteryVol", [0x10, 0xff, 0x50, 0xf1]],
+    ["getPaperType", [0x1f, 0x80, 0x00]],
+    ["getDensity", [0x1f, 0x70, 0x00]],
+    ["getSpeed", [0x1f, 0x60, 0x00]],
+    ["getShutTime", [0x10, 0xff, 0x13]],
+  ];
+  for (const [name, bytes] of queries) {
+    log(`診断 query: ${name} (${bytes.map(b => b.toString(16).padStart(2, "0")).join(" ")})`);
+    await writeChar.writeValueWithResponse(new Uint8Array(bytes));
+    await sleep(800);
+  }
+  log("診断: 応答待ち (2秒)...");
+  await sleep(2000);
+  server.disconnect();
+  log("診断: 終了");
+}
+
+document.getElementById("btn-diagnose").addEventListener("click", async () => {
+  if (!navigator.bluetooth) return log("このブラウザは Web Bluetooth 非対応です");
+  try {
+    await diagnose(document.getElementById("opt-show-all").checked);
+  } catch (err) {
+    log("診断エラー: " + err);
+  }
+});
 
 document.getElementById("btn-print").addEventListener("click", async () => {
   if (!currentPayload) return log("先にプレビューを生成してください");
