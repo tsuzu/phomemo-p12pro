@@ -191,8 +191,27 @@ async function pickDevice(showAll) {
 
 async function sendPayload(payload, showAll) {
   const device = await pickDevice(showAll);
-  log(`接続中: ${device.name || device.id}`);
-  const server = await device.gatt.connect();
+  log(`選択: name=${device.name || "(なし)"} id=${device.id}`);
+  let server;
+  try {
+    server = await device.gatt.connect();
+  } catch (e1) {
+    log(`GATT接続に失敗 (${e1}) — 1回だけ再試行します`);
+    await sleep(600);
+    try {
+      server = await device.gatt.connect();
+    } catch (e2) {
+      if (String(e2).includes("Unsupported device")) {
+        log("ヒント: 'Unsupported device' は、そのデバイスが GATT (BLE) 接続に対応していない" +
+            "エントリを選んだときに Chrome が出すエラーです。プリンタがデュアルモードの場合、" +
+            "一覧に同名の Classic 側エントリが混ざることがあります。別のエントリを選ぶか、" +
+            "OS の Bluetooth 設定でこのプリンタのペアリングを一度解除してから再試行してください" +
+            " (Web Bluetooth に OS ペアリングは不要です)。");
+      }
+      throw e2;
+    }
+  }
+  log("GATT接続 OK");
   let service;
   try {
     service = await server.getPrimaryService(0xff00);
