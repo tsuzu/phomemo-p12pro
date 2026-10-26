@@ -331,6 +331,46 @@ async function diagnose(showAll) {
   log("診断: 終了");
 }
 
+// Send one small raw command over a fresh connection (self-check,
+// paper feed). Confirms whether ANY command produces a physical
+// reaction, independently of image encoding.
+async function sendRawCommand(label, bytes, showAll) {
+  const device = await pickDevice(showAll);
+  log(`${label}: 選択 name=${device.name || "(なし)"}`);
+  const server = await device.gatt.connect();
+  const service = await server.getPrimaryService(0xff00);
+  const writeChar = await service.getCharacteristic(0xff02);
+  try {
+    const flowChar = await service.getCharacteristic(0xff03);
+    await flowChar.startNotifications();
+    flowChar.addEventListener("characteristicvaluechanged", (e) => {
+      const v = e.target.value;
+      const hex = [...new Uint8Array(v.buffer, v.byteOffset, v.byteLength)]
+        .map(b => b.toString(16).padStart(2, "0")).join(" ");
+      log(`${label} notify: ${hex}`);
+    });
+  } catch (_) { /* flow char optional here */ }
+  await writeChar.writeValueWithResponse(new Uint8Array(bytes));
+  log(`${label}: コマンド送信 (${bytes.map(b => b.toString(16).padStart(2, "0")).join(" ")}) — 反応を3秒待ちます`);
+  await sleep(3000);
+  server.disconnect();
+  log(`${label}: 終了`);
+}
+
+document.getElementById("btn-selfcheck").addEventListener("click", async () => {
+  if (!navigator.bluetooth) return log("このブラウザは Web Bluetooth 非対応です");
+  try {
+    await sendRawCommand("セルフテスト", [0x1f, 0x40], document.getElementById("opt-show-all").checked);
+  } catch (err) { log("セルフテストエラー: " + err); }
+});
+
+document.getElementById("btn-feed").addEventListener("click", async () => {
+  if (!navigator.bluetooth) return log("このブラウザは Web Bluetooth 非対応です");
+  try {
+    await sendRawCommand("紙送り", [0x1f, 0x11, 0x50], document.getElementById("opt-show-all").checked);
+  } catch (err) { log("紙送りエラー: " + err); }
+});
+
 document.getElementById("btn-diagnose").addEventListener("click", async () => {
   if (!navigator.bluetooth) return log("このブラウザは Web Bluetooth 非対応です");
   try {
